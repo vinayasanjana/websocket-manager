@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+motor
+pymongo
+psutil
+prometheus-fastapi-instrumentator
+prometheus-client
+python-dotenv
