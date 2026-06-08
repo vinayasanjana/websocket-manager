@@ -1,186 +1,124 @@
-# LiveChat — WebSocket Manager with Anomaly Detection
+# LiveChat — Merged Project
 
-A real-time WebSocket chat system with a built-in anomaly detection engine, malicious link filtering, email alerts, MongoDB persistence, and a live Streamlit monitoring dashboard.
+## What changed (and why the bugs are fixed)
 
----
+### The root cause of your bugs
+Both codebases were handling the **same WebSocket events independently**:
+- Your code broadcast `"joined"` / `"left"` system messages
+- The team lead's connection manager also dispatched connection/disconnection events
+- Both sides called `broadcast_users()` on connect/disconnect
 
-## Project Structure
+Result: every join/leave fired **twice**, and the user list refreshed **twice** per event — causing the phantom join/leave spam you saw.
 
-```
-websocket-manager/
-├── Backend/
-│   ├── main.py                  ← FastAPI server (chat + anomaly engine)
-│   ├── requirements.txt
-│   └── templates/
-│       ├── admin.html           ← Admin monitoring panel  (GET /)
-│       └── index.html           ← Chat UI                 (GET /chat)
-├── dashboard/
-│   ├── app.py                   ← Streamlit live dashboard
-│   └── requirements.txt
-├── simulator/
-│   ├── enhanced_simulator.py    ← Load testing tool
-│   └── requirements.txt
-├── .env.example                 ← Copy to .env and fill in your values
-├── .gitignore
-└── README.md
-```
+### How it's fixed
+There is now **exactly one WebSocket handler** (`ws_endpoint` in `main.py`). The team lead's anomaly detection is integrated as **hooks** called at the right moments inside your existing flow — not as a parallel system:
+
+| Event | Your code | Team lead hook added |
+|---|---|---|
+| Connect | Welcome, load history, broadcast join | `anomaly_detector.on_connect()` |
+| Chat message | Rate check, broadcast | `anomaly_detector.on_message()` → score → maybe strike/ban |
+| Malicious link | Block, save, alert | `anomaly_detector.on_message(was_malicious=True)` |
+| Idle kick | Kick, broadcast | `anomaly_detector.on_idle_kick()` |
+| Disconnect | Broadcast leave | `anomaly_detector.on_disconnect()` |
 
 ---
 
-## Quick Start
+## Project structure
 
-### 1. Clone and set up environment
-
-```bash
-git clone https://github.com/YOUR_USERNAME/websocket-manager.git
-cd websocket-manager
-
-python -m venv .venv
-
-# Windows
-.venv\Scripts\activate
-
-# Mac/Linux
-source .venv/bin/activate
+```
+livechat_merged/
+├── main.py              ← merged backend (your code + team lead's anomaly engine)
+├── dashboard.py         ← Streamlit dashboard (your 3 tabs + new Anomaly tab)
+├── requirements.txt     ← all dependencies
+├── .env                 ← your existing .env (copy it here, do not commit)
+└── templates/
+    ├── index.html       ← your chat UI (UNCHANGED)
+    └── admin.html       ← your admin panel (UNCHANGED)
 ```
 
-### 2. Install dependencies
+> **Copy your existing `templates/` folder** into `livechat_merged/templates/` — those files are not changed at all.
 
-```bash
-pip install -r Backend/requirements.txt
-pip install -r dashboard/requirements.txt
-```
+---
 
-### 3. Configure environment
+## New features (team lead's anomaly detection)
 
-```bash
-cp .env.example .env
-# Edit .env — add your Gmail app password and MongoDB URI
-```
+### AnomalyDetector class
+Scores each user's behaviour in real time (0.0 = clean, 1.0+ = highly suspicious).
 
-### 4. Start the backend
+Signals scored:
+- **Burst rate** — too many messages in the sliding window
+- **Reconnect frequency** — reconnecting excessively
+- **Malicious content** — flagged by your existing link detector
+- **Idle-kick pattern** — repeatedly getting idle-kicked
+- **Message size** — unusually long messages (injection attempts)
 
-```bash
-cd Backend
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-```
+### TempBanManager class
+Bans a username for `TEMP_BAN_SECONDS` (default 120s) when their strike count reaches `THREAT_STRIKE_THRESHOLD` (default 20). Ban check runs on connect — the user gets a clear error message and the socket closes cleanly.
 
-### 5. Start the dashboard (new terminal)
-
-```bash
-cd dashboard
-streamlit run app.py
-```
-
-| Service | URL |
+### Two MongoDB databases (no overlap)
+| Database | Used for |
 |---|---|
-| Chat UI | http://localhost:8000/chat |
-| Admin Panel | http://localhost:8000 |
-| Streamlit Dashboard | http://localhost:8501 |
-| API Docs | http://localhost:8000/docs |
+| `livechat` (yours) | messages, metrics, alerts, sessions, rate_logs, graphs |
+| `threat_gateway` (team lead) | threat_events collection only |
+
+### New API endpoints
+| Endpoint | Description |
+|---|---|
+| `GET /threats` | Raw threat events from `threat_gateway` DB |
+| `GET /threat-stats` | Live anomaly scores for all users |
+| `GET /banned` | Currently temp-banned users + time remaining |
+
+### New Streamlit tab
+Tab 2 "🛡️ Anomaly Detection" shows:
+- Protection on/off + thresholds
+- Active bans with time remaining
+- Per-user anomaly scores (colour-coded, bar chart)
+- Raw threat events from `threat_gateway` DB
+- Threat action breakdown pie chart
+
+### Dynamic snapshot interval
+Snapshots now save faster when threats are detected:
+- Normal: every 10s (your original)
+- Elevated (score ≥ threshold): every `ELEVATED_SNAPSHOT_INTERVAL_SECONDS` (default 4s)
+- Lockdown (score ≥ 1.5× threshold): every `LOCKDOWN_SNAPSHOT_INTERVAL_SECONDS` (default 6s)
 
 ---
 
-## API Endpoints
-
-### Chat
-| Method | Endpoint | Description |
-|---|---|---|
-| `WS` | `/ws` | WebSocket chat connection |
-| `GET` | `/stats` | Live chat metrics |
-| `GET` | `/history` | Chat message history |
-| `GET` | `/blocked-links` | Blocked malicious URLs |
-| `GET` | `/alerts-history` | Email alert log |
-| `GET` | `/graph-history` | Historical chart data |
-| `GET` | `/activity` | All activity by date range |
-
-### Anomaly Detection
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/metrics` | Unified metrics + anomaly scores |
-| `GET` | `/threats/history` | Threat event log with scores |
-| `GET` | `/admin/protection` | Protection status + active bans |
-| `POST` | `/admin/protection-mode` | Force a protection mode |
-| `POST` | `/admin/unban/{ip}` | Unban an IP |
-| `GET` | `/admin/model-profiles` | List anomaly model profiles |
-| `POST` | `/admin/model-profile/apply` | Switch active profile |
-| `POST` | `/admin/buffers/clear` | Clear in-memory buffers |
-
-### Prometheus
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/prometheus-metrics` | Prometheus scrape endpoint |
-
----
-
-## Anomaly Detection
-
-Every message passes through a 4-factor scoring engine:
-
-| Factor | What it measures | Weight |
-|---|---|---|
-| Burst | Messages sent in the last 5s | 0.40 |
-| Reconnect | IP reconnect frequency | 0.25 |
-| Strike | Previous anomaly flags | 0.20 |
-| Density | Messages/second since connect | 0.15 |
-
-Score ≥ **0.95** = anomaly flagged. After repeated flags, the IP is temporarily banned.
-
-### Switch profiles at runtime (no restart needed)
-```bash
-# More sensitive — bans faster
-curl -X POST "http://localhost:8000/admin/model-profile/apply?profile_id=aggressive"
-
-# Default
-curl -X POST "http://localhost:8000/admin/model-profile/apply?profile_id=balanced"
-
-# More tolerant — fewer false positives
-curl -X POST "http://localhost:8000/admin/model-profile/apply?profile_id=conservative"
-```
-
----
-
-## Simulator
+## Running the project
 
 ```bash
-cd simulator
+# 1. Install dependencies
 pip install -r requirements.txt
 
-# Normal chat traffic
-python enhanced_simulator.py --mode normal
+# 2. Copy your .env file into this folder
+cp /path/to/your/.env .env
 
-# Flood attack (triggers rate limiting + anomaly scoring)
-python enhanced_simulator.py --mode flood --duration 30
+# 3. Copy your templates
+cp -r /path/to/your/templates ./templates
 
-# Idle bots (triggers idle disconnect)
-python enhanced_simulator.py --mode idle
+# 4. Start the backend
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
-# Burst connections
-python enhanced_simulator.py --mode burst --duration 50
+# 5. Start the dashboard (separate terminal)
+streamlit run dashboard.py
 ```
 
 ---
 
-## Gmail Setup (for email alerts)
+## .env variables used by the merged system
 
-1. Go to your Google Account → Security → 2-Step Verification (must be on)
-2. Search "App passwords" → Create one for "Mail"
-3. Copy the 16-character password into `.env` as `EMAIL_PASSWORD`
+All your existing variables are still used. These team lead variables are now also read:
 
----
-
-## MongoDB
-
-MongoDB is **optional**. The server runs without it — data just won't persist across restarts.
-
-For a free cloud database: [MongoDB Atlas](https://www.mongodb.com/atlas) → get a connection string → paste into `MONGODB_URI` in `.env`.
-
----
-
-## Deployment (Railway / Render)
-
-1. Push this repo to GitHub
-2. On Railway or Render, create a new service from the repo
-3. Set the start command: `uvicorn Backend.main:app --host 0.0.0.0 --port $PORT`
-4. Add all variables from `.env.example` as environment variables in the dashboard
-5. Add a MongoDB Atlas URI as `MONGODB_URI`
+```env
+MONGODB_THREAT_DATABASE=threat_gateway
+MONGODB_COLLECTION=threat_events
+ANOMALY_SCORE_THRESHOLD=0.95
+THREAT_STRIKE_THRESHOLD=20
+PROTECTION_ENABLED=true
+RECONNECT_LIMIT=300
+TEMP_BAN_SECONDS=120
+RECENT_ACTIVITY_WINDOW_SECONDS=30
+SNAPSHOT_INTERVAL_SECONDS=2
+ELEVATED_SNAPSHOT_INTERVAL_SECONDS=4
+LOCKDOWN_SNAPSHOT_INTERVAL_SECONDS=6
+```
